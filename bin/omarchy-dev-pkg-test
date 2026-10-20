@@ -133,5 +133,11 @@ for PKG in "${PKGS[@]}"; do
     echo "Error: no built package found in $package_build_dir" >&2
     exit 1
   fi
-  sudo pacman -U --noconfirm --overwrite='*' "$built_pkg"
+  # Build as the caller; elevate only the system package manager. Agents and
+  # other callers without a terminal need the desktop authorization dialog.
+  if [[ -t 0 ]]; then
+    sudo /usr/bin/pacman -U --noconfirm --overwrite='*' "$built_pkg"
+  else
+    pkexec /usr/bin/pacman -U --noconfirm --overwrite='*' "$built_pkg"
+  fi
 done
