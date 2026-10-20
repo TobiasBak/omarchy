@@ -78,6 +78,27 @@ grep -q 'PROTECT: "Y"' "$COMPOSE" || fail "web console is not password protected
 grep -q -- '- /:/' "$COMPOSE" && fail "compose contains host-root bind"
 pass "writer emits fixed anchors bound to exact private source inodes"
 
+# Preparation reuses the audited guard without invoking Docker, readiness or
+# RDP, even if a running container already exists. Repeating it changes no
+# mount identity or configuration.
+prepare_calls="$TMPDIR/prepare-calls"
+: >"$prepare_calls"
+docker() { printf 'docker %s\n' "$*" >>"$prepare_calls"; printf 'running\n'; }
+docker-compose() { printf 'compose %s\n' "$*" >>"$prepare_calls"; }
+xfreerdp3() { printf 'rdp %s\n' "$*" >>"$prepare_calls"; }
+sleep() { printf 'sleep %s\n' "$*" >>"$prepare_calls"; }
+compose_before_prepare=$(sha256sum "$COMPOSE")
+storage_before_prepare=$(stat -Lc '%d:%i' "$EXPECTED_STORAGE")
+shared_before_prepare=$(stat -Lc '%d:%i' "$EXPECTED_SHARED")
+__priv_prepare || fail "preparation rejected a ready VM"
+__priv_prepare || fail "repeated preparation rejected a ready VM"
+[[ $(sha256sum "$COMPOSE") == "$compose_before_prepare" &&
+  $(stat -Lc '%d:%i' "$EXPECTED_STORAGE") == "$storage_before_prepare" &&
+  $(stat -Lc '%d:%i' "$EXPECTED_SHARED") == "$shared_before_prepare" ]] || fail "preparation changed ready configuration or mounts"
+[[ ! -s $prepare_calls ]] || fail "preparation touched Docker, readiness or RDP"
+unset -f docker docker-compose xfreerdp3 sleep
+pass "preparation is idempotent and never touches the container or guest"
+
 # Input cannot widen a mount or compose field.
 rm -f "$COMPOSE"
 write 4G 2 64G 'x -v /:/h' p UTC 2>/dev/null && fail "malicious username accepted"
@@ -94,7 +115,7 @@ grep -q 'PASSWORD: ".*\$\$.*"' "$COMPOSE" || fail "dollar not escaped"
 [[ $(unescape "$(read_compose_value PASSWORD "$COMPOSE")") == "$tricky" ]] || fail "password did not round-trip"
 pass "password with quote, backslash, and dollar round-trips"
 
-for action in write_compose up up_wait down status remove; do
+for action in write_compose prepare up up_wait down status remove; do
   valid_priv_action "$action" || fail "known action rejected: $action"
 done
 for action in '/../evil/x' bogus 'up;rm' '' '__priv_up'; do

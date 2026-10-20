@@ -190,13 +190,63 @@ printf 'RAM=4G\nCORES=2\nDISK=64G\nUSERNAME=alice\nPASSWORD=pw\nTZ=UTC\n' |
 with_vm_lock assert_mounts_safe || fail "final root mount/compose assertion rejected the verified pair"
 pass "root writer and final pre-Docker guard revalidate the pinned production mounts"
 
+# Run the exact privileged dispatcher. A running container is deliberately
+# available from the fake Docker boundary, but prepare must never query it.
+prepare_calls="$test_tmp/prepare-calls"
+: >"$prepare_calls"
+omarchy-hw-x86() { :; }
+docker() { printf 'docker %s\n' "$*" >>"$prepare_calls"; printf 'running\n'; }
+docker-compose() { printf 'compose %s\n' "$*" >>"$prepare_calls"; }
+xfreerdp3() { printf 'rdp %s\n' "$*" >>"$prepare_calls"; }
+sleep() { printf 'sleep %s\n' "$*" >>"$prepare_calls"; }
+prepare_dispatch() {
+  set -- __priv prepare
+  source "$test_tmp/omarchy-windows-vm"
+}
+prepare_dispatch || fail "privileged prepare dispatcher failed"
+compose_before_prepare=$(sha256sum "$COMPOSE_FILE")
+prepare_dispatch || fail "privileged preparation was not idempotent"
+[[ $(sha256sum "$COMPOSE_FILE") == "$compose_before_prepare" ]] || fail "ready preparation rewrote config"
+flock -n "$VM_LOCK_DIR" true || fail "privileged preparation retained the lifecycle lock"
+
+# Simulate reboot and a failed second bind. Only the newly created first bind
+# is rolled back; config and caller sources survive and a retry restores access.
+umount "$EXPECTED_SHARED"
+umount "$EXPECTED_STORAGE"
+mount() {
+  if [[ ${!#} == "$EXPECTED_SHARED" ]]; then
+    echo "injected shared bind failure" >&2
+    return 1
+  fi
+  command mount "$@"
+}
+prepare_error=$(prepare_dispatch 2>&1) && fail "preparation hid a failed restoration"
+unset -f mount
+[[ $prepare_error == *'injected shared bind failure'* ]] || fail "restoration failure lost its diagnostic"
+[[ $(mount_layer_count "$EXPECTED_STORAGE") == 0 &&
+  $(mount_layer_count "$EXPECTED_SHARED") == 0 ]] || fail "failed preparation left partial binds"
+[[ $(sha256sum "$COMPOSE_FILE") == "$compose_before_prepare" &&
+  -f /home/storage-target/disk.img && -f /home/shared-target/shared.txt ]] || fail "failed preparation changed config or source data"
+flock -n "$VM_LOCK_DIR" true || fail "failed preparation retained the lifecycle lock"
+prepare_dispatch || fail "preparation could not restore post-reboot source access"
+mounts_ready || fail "post-reboot preparation left unsafe mounts"
+
+PKEXEC_UID=0
+prepare_dispatch 2>/dev/null && fail "privileged prepare accepted root caller identity"
+PKEXEC_UID=1000
+chmod 0666 "$COMPOSE_FILE"
+prepare_dispatch 2>/dev/null && fail "privileged prepare accepted a writable compose"
+chmod 0640 "$COMPOSE_FILE"
+[[ ! -s $prepare_calls ]] || fail "privileged preparation touched the container or guest"
+pass "privileged prepare restores reboot mounts, rolls back errors, rejects unsafe identity/config and never touches Docker or the guest"
+
 # Upgrade the exact sibling-anchor pair emitted by the earlier fix without
 # moving or replacing either familiar home symlink.
 sed -i "s|$EXPECTED_STORAGE:/storage|$OLD_EXPECTED_STORAGE:/storage|" "$COMPOSE_FILE"
 sed -i "s|$EXPECTED_SHARED:/shared|$OLD_EXPECTED_SHARED:/shared|" "$COMPOSE_FILE"
 sed -i '/PROTECT: "Y"/d' "$COMPOSE_FILE"
 compose_needs_security_migration || fail "previous protected compose was not recognized for upgrade"
-with_vm_lock assert_mounts_safe || fail "root could not upgrade previous protected anchors"
+prepare_dispatch || fail "preparation could not upgrade previous protected anchors"
 grep -q -- "- $EXPECTED_STORAGE:/storage" "$COMPOSE_FILE" || fail "upgrade did not rewrite storage anchor"
 grep -q -- "- $EXPECTED_SHARED:/shared" "$COMPOSE_FILE" || fail "upgrade did not rewrite shared anchor"
 grep -q 'PROTECT: "Y"' "$COMPOSE_FILE" || fail "upgrade did not protect the web console"
@@ -207,7 +257,7 @@ pass "previous sibling-anchor installs upgrade in place to the fixed /var/lib bo
 # upgrade when it predates web-console authentication.
 sed -i '/PROTECT: "Y"/d' "$COMPOSE_FILE"
 compose_needs_security_migration || fail "unprotected fixed-anchor compose was not recognized for upgrade"
-with_vm_lock assert_mounts_safe || fail "root could not protect an existing fixed-anchor compose"
+prepare_dispatch || fail "preparation could not protect an existing fixed-anchor compose"
 grep -q 'PROTECT: "Y"' "$COMPOSE_FILE" || fail "fixed-anchor upgrade did not protect the web console"
 pass "existing fixed-anchor compose gains web-console authentication"
 
