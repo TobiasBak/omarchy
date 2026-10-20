@@ -2,14 +2,15 @@
 
 # omarchy:summary=Build and install an Omarchy package from a local checkout
 # omarchy:group=dev
-# omarchy:args=[package-name] [path-to-checkout]
+# omarchy:args=[--keep-package-metadata] [package-name] [path-to-checkout] [makepkg-options...]
 # omarchy:examples=omarchy dev pkg-test | omarchy dev pkg-test omarchy-dev ~/Work/omarchy/omarchy-installer
 
 set -euo pipefail
 
 if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
   cat <<USAGE
-Usage: omarchy dev pkg-test [package-name] [path-to-checkout]
+Usage: omarchy dev pkg-test [package-name] [path-to-checkout] [makepkg-options...]
+       omarchy dev pkg-test --keep-package-metadata <package-name> <path-to-checkout> [makepkg-options...]
 
 Builds and installs an Omarchy package from a local Omarchy source
 checkout. Use when changes need to land at fixed system paths (/etc/,
@@ -25,8 +26,14 @@ Examples:
   omarchy dev pkg-test omarchy-settings-dev
   omarchy dev pkg-test omarchy-dev ~/Work/omarchy/omarchy-installer
 
+By default, omarchy and omarchy-settings map to their -dev packages.
 The pkgver of the built package is tagged 'dev.<short-sha>[.dirty]' so
 'pacman -Q' makes it obvious where the installed version came from.
+
+--keep-package-metadata requires an explicit package name and checkout.
+It keeps that recipe's package name, pkgver and pkgrel unchanged, prints
+its metadata, and installs without --overwrite='*'. Use a qualified recipe
+for local backports that must not switch the workstation's update channel.
 
 PKGBUILDs are read from \${OMARCHY_PKGBUILDS_DIR:-~/Work/omarchy/omarchy-pkgs/pkgbuilds}/<package-name>/.
 USAGE
@@ -71,7 +78,23 @@ dev_package_name() {
   esac
 }
 
-if (( $# == 0 )); then
+# Qualified local backports must not switch the workstation's update channel.
+# Keep their native recipe metadata only when the caller explicitly opts in.
+keep_package_metadata=0
+if [[ ${1:-} == "--keep-package-metadata" ]]; then
+  if (($# < 3)) || [[ -z $2 || -z $3 || $2 == -* || $3 == -* ]]; then
+    echo "Error: --keep-package-metadata requires an explicit package name and checkout" >&2
+    exit 1
+  fi
+  keep_package_metadata=1
+  shift
+fi
+
+if ((keep_package_metadata)); then
+  PKGS=("$1")
+  CHECKOUT="$2"
+  MAKEPKG_ARGS=("${@:3}")
+elif (( $# == 0 )); then
   PKGS=(omarchy-settings-dev omarchy-dev)
   CHECKOUT="$HOME/Work/omarchy/omarchy-installer"
   MAKEPKG_ARGS=()
@@ -98,13 +121,20 @@ done
 build_dir=$(mktemp -d -t omarchy-dev-pkg-test.XXXXXX)
 trap 'rm -rf "$build_dir"' EXIT
 
-# pkgver=dev.<sha>[.dirty] so pacman -Q makes the source obvious.
-short_sha=$(git -C "$CHECKOUT" rev-parse --short HEAD 2>/dev/null || echo "local")
-dirty=""
-if [[ -d "$CHECKOUT/.git" ]] && [[ -n "$(git -C "$CHECKOUT" status --porcelain)" ]]; then
-  dirty=".dirty"
+if ((!keep_package_metadata)); then
+  # pkgver=dev.<sha>[.dirty] so pacman -Q makes the source obvious.
+  short_sha=$(git -C "$CHECKOUT" rev-parse --short HEAD 2>/dev/null || echo "local")
+  dirty=""
+  if [[ -d "$CHECKOUT/.git" ]] && [[ -n "$(git -C "$CHECKOUT" status --porcelain)" ]]; then
+    dirty=".dirty"
+  fi
+  new_pkgver="dev.${short_sha}${dirty}"
 fi
-new_pkgver="dev.${short_sha}${dirty}"
+
+install_args=(-U --noconfirm)
+if ((!keep_package_metadata)); then
+  install_args+=(--overwrite='*')
+fi
 
 for PKG in "${PKGS[@]}"; do
   PKGBUILD_DIR="$PKGBUILDS_ROOT/$PKG"
@@ -112,22 +142,29 @@ for PKG in "${PKGS[@]}"; do
   mkdir -p "$package_build_dir"
   cp -a "$PKGBUILD_DIR/." "$package_build_dir/"
 
-  remove_pkgver_function "$package_build_dir/PKGBUILD"
-  sed -i "s/^pkgver=.*/pkgver=${new_pkgver}/" "$package_build_dir/PKGBUILD"
-
-  echo "Building $PKG ${new_pkgver} from $CHECKOUT"
+  if ((keep_package_metadata)); then
+    echo "Building $PKG from $CHECKOUT with unchanged PKGBUILD metadata"
+  else
+    remove_pkgver_function "$package_build_dir/PKGBUILD"
+    sed -i "s/^pkgver=.*/pkgver=${new_pkgver}/" "$package_build_dir/PKGBUILD"
+    echo "Building $PKG ${new_pkgver} from $CHECKOUT"
+  fi
   echo "  build dir: $package_build_dir"
   echo "  PKGBUILD : $PKGBUILD_DIR/PKGBUILD"
   echo
 
   (
     cd "$package_build_dir"
+    if ((keep_package_metadata)); then
+      OMARCHY_SRC="$CHECKOUT" makepkg --printsrcinfo |
+        awk '$1 == "pkgname" || $1 == "pkgver" || $1 == "pkgrel" || $1 == "epoch" { print }'
+    fi
     OMARCHY_SRC="$CHECKOUT" makepkg -s --skipchecksums --noconfirm "${MAKEPKG_ARGS[@]}"
   )
 
-  # Install separately so we can pass --overwrite='*' (makepkg -i can't).
-  # Dev builds frequently conflict with files left behind by previous
-  # script-installed Omarchy versions; the build is the authoritative state.
+  # Install separately so default dev builds can pass --overwrite='*'
+  # (makepkg -i can't) for files left by old script-installed versions.
+  # Conservative backports instead let package ownership collisions fail.
   built_pkg=$(ls -t "$package_build_dir"/*.pkg.tar.* 2>/dev/null | grep -v '\.sig$' | head -1)
   if [[ -z $built_pkg ]]; then
     echo "Error: no built package found in $package_build_dir" >&2
@@ -136,8 +173,8 @@ for PKG in "${PKGS[@]}"; do
   # Build as the caller; elevate only the system package manager. Agents and
   # other callers without a terminal need the desktop authorization dialog.
   if [[ -t 0 ]]; then
-    sudo /usr/bin/pacman -U --noconfirm --overwrite='*' "$built_pkg"
+    sudo /usr/bin/pacman "${install_args[@]}" "$built_pkg"
   else
-    pkexec /usr/bin/pacman -U --noconfirm --overwrite='*' "$built_pkg"
+    pkexec /usr/bin/pacman "${install_args[@]}" "$built_pkg"
   fi
 done
