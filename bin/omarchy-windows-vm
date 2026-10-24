@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# omarchy:summary=Install, prepare, launch, stop, inspect, or remove the Windows VM
-# omarchy:args=<install|prepare|remove|launch|stop|status> [options]
+# omarchy:summary=Install, launch, stop, inspect, or remove the Windows VM
+# omarchy:args=<install|remove|launch|stop|status> [options]
 # omarchy:requires-sudo=true
 
 # The VM is an x86_64 Windows guest under KVM, which only an x86_64 host runs.
@@ -97,7 +97,7 @@ priv() {
     # the protected bind anchors after reboot (or migrating an old compose)
     # still needs one privileged invocation.
     if [[ -d $VM_LOCK_DIR && ! -L $VM_LOCK_DIR && -r $VM_LOCK_DIR && -x $VM_LOCK_DIR ]] && {
-      [[ $action != prepare && $action != up && $action != up_wait ]] || {
+      [[ $action != up && $action != up_wait ]] || {
         ! compose_needs_security_migration && mounts_ready >/dev/null 2>&1
       }
     }; then
@@ -152,7 +152,7 @@ valid_password() { [[ $1 =~ ^[[:print:]]{1,64}$ ]]; }
 # ../tmp/evil from running an arbitrary file as root.
 valid_priv_action() {
   case "$1" in
-  write_compose | prepare | up | up_wait | down | status | remove) return 0 ;;
+  write_compose | up | up_wait | down | status | remove) return 0 ;;
   *) return 1 ;;
   esac
 }
@@ -902,11 +902,6 @@ assert_mounts_safe() {
   }
 }
 
-# Filesystem preparation only. Keep this separate from bring-up so a caller can
-# release the lifecycle lock, admit memory, then revalidate and start under its
-# own final lock. In particular, preparation must not touch a running container.
-__priv_prepare() { assert_mounts_safe; }
-
 __priv_up() { assert_mounts_safe && dc up -d; }
 
 __priv_down() { dc down; }
@@ -1514,18 +1509,6 @@ To stop: omarchy-windows-vm stop"
   fi
 }
 
-prepare_windows() {
-  if (($#)); then
-    echo "omarchy-windows-vm prepare takes no arguments" >&2
-    return 1
-  fi
-  migrate_legacy_compose || {
-    echo "Could not prepare Windows VM configuration. To set up: omarchy-windows-vm install" >&2
-    return 1
-  }
-  priv prepare
-}
-
 stop_windows() {
   migrate_legacy_compose 2>/dev/null || true
   if [[ ! -f $COMPOSE_FILE ]]; then
@@ -1583,7 +1566,6 @@ show_usage() {
   echo ""
   echo "Commands:"
   echo "  install              Install and configure Windows VM"
-  echo "  prepare              Validate/restore VM mounts and configuration without starting or stopping Windows"
   echo "  remove               Remove Windows VM and optionally its data"
   echo "  launch [options]     Start Windows VM (if needed) and connect via RDP"
   echo "                       Options:"
@@ -1616,13 +1598,6 @@ __priv)
   ;;
 install)
   install_windows
-  ;;
-prepare)
-  if [[ ${2:-} == "--help" || ${2:-} == "-h" ]]; then
-    show_usage
-  else
-    prepare_windows "${@:2}"
-  fi
   ;;
 remove)
   remove_windows
